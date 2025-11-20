@@ -59,4 +59,4 @@ async fn main() {
 
 ## License
 
-This project is licensed under the Apache-2.0 License.
+This project is licensed under the MIT License.
