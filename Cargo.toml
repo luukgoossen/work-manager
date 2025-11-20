@@ -10,6 +10,7 @@ homepage = "https://github.com/luukgoossen/work-manager"
 readme = "README.md"
 keywords = ["workmanager", "work", "manager", "tokio", "async"]
 categories = ["asynchronous", "concurrency"]
+exclude = [".github/*"]
 
 [dependencies]
 tokio = { version = "1.48.0", features = [
