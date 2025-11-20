@@ -16,6 +16,7 @@
 //! use work_manager::{Job, WorkManager};
 //! use std::time::Duration;
 //!
+//! #[derive(Clone)]
 //! struct PrintJob {
 //!     message: String,
 //! }
