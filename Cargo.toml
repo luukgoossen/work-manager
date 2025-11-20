@@ -11,7 +11,18 @@ keywords = ["workmanager", "work", "manager", "tokio", "async"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-tokio = { version = "1.48.0", features = ["rt", "time", "macros"] }
+tokio = { version = "1.48.0", features = [
+	"rt",
+	"rt-multi-thread",
+	"time",
+	"macros",
+] }
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["rt", "time", "macros", "sync"] }
+tokio = { version = "1.48.0", features = [
+	"rt",
+	"rt-multi-thread",
+	"time",
+	"macros",
+	"sync",
+] }
