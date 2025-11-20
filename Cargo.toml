@@ -1,8 +1,17 @@
 [package]
 name = "work-manager"
-authors = ["Luuk Goossen"]
 version = "0.1.0"
 edition = "2024"
+authors = ["Luuk Goossen"]
+description = "A library for managing asynchronous work tasks."
+license = "Apache-2.0"
+repository = "https://github.com/ljgoossen/work-manager"
+readme = "README.md"
+keywords = ["workmanager", "work", "manager", "tokio", "async"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio = { version = "1.48.0", features = ["rt", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["rt", "time", "macros", "sync"] }
