@@ -44,20 +44,22 @@
 //!     PrintJob { message: "Tick".into() },
 //!     Duration::from_secs(1),
 //!     false,
-//!     false
+//!     |_| Ok(())
 //! );
 //! # }
 //! ```
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::error::Error;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::Duration;
 
 /// A job that can be run asynchronously.
 pub trait Job: Send + Sync + Sized {
     type Output: Send + Sync + 'static;
-    type Error: Send + Sync + 'static;
+    /// Job-specific error type. Must be convertible into a boxed error so
+    /// `WorkManager` does not need to be generic over the error.
+    type Error: Send + Sync + 'static + Into<Box<dyn Error + Send + Sync>>;
 
     /// Runs the job and returns the result.
     fn run(
@@ -114,12 +116,12 @@ where
 }
 
 /// Manages the execution of asynchronous jobs.
-pub struct WorkManager<E> {
-    handles: HashMap<String, JoinHandle<Result<(), E>>>,
+pub struct WorkManager {
+    handles: HashMap<String, JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>>,
 }
 
 // Implement common methods for WorkManager
-impl<E> WorkManager<E> {
+impl WorkManager {
     /// Creates a new WorkManager.
     pub fn new() -> Self {
         Self {
@@ -143,15 +145,10 @@ impl<E> WorkManager<E> {
 }
 
 // Implement job-focused methods for WorkManager
-impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
+impl WorkManager {
     /// Enqueues a job for execution.
     /// If a job with the same name already exists, it will be overwritten if `overwrite` is true.
-    pub fn enqueue(
-        &mut self,
-        name: &str,
-        job: impl Job<Error = E> + 'static,
-        overwrite: bool,
-    ) -> bool {
+    pub fn enqueue(&mut self, name: &str, job: impl Job + 'static, overwrite: bool) -> bool {
         if self.handles.contains_key(name) {
             if overwrite {
                 self.cancel(name);
@@ -160,26 +157,31 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
             }
         }
 
-        let handle: JoinHandle<Result<(), E>> = spawn(async move {
-            job.run().await?;
-            Ok(())
-        });
+        let handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> =
+            spawn(async move { job.run().await.map(|_| ()).map_err(Into::into) });
 
         self.handles.insert(name.into(), handle);
-        return true;
+        true
     }
 
     /// Enqueues a periodic job for execution at specified intervals.
     /// If a job with the same name already exists, it will be overwritten if `overwrite` is true.
-    /// If `panic` is true, the periodic job will cancel and return the error upon encountering one.
-    pub fn enqueue_periodic(
+    ///
+    /// `on_error` is a callback that is invoked whenever the job returns an error.
+    /// The callback receives the job's error and returns `Ok` to continue or
+    /// `Err` to stop the periodic execution and finish the task.
+    pub fn enqueue_periodic<J, F>(
         &mut self,
         name: &str,
-        job: impl Job<Error = E> + Clone + 'static,
+        job: J,
         interval: Duration,
         overwrite: bool,
-        panic: bool,
-    ) -> bool {
+        on_error: F,
+    ) -> bool
+    where
+        J: Job + Clone + 'static,
+        F: Fn(J::Error) -> Result<(), J::Error> + Send + Sync + 'static,
+    {
         if self.handles.contains_key(name) {
             if overwrite {
                 self.cancel(name);
@@ -188,30 +190,29 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
             }
         }
 
-        let handle: JoinHandle<Result<(), E>> = spawn(async move {
+        let handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> = spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 match job.clone().run().await {
                     Ok(_) => {}
-                    Err(e) => {
-                        if panic {
-                            return Err(e);
-                        } else {
-                            eprintln!("Error: {:?}", e);
+                    Err(e) => match on_error(e) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(e.into());
                         }
-                    }
+                    },
                 }
                 interval.tick().await;
             }
         });
 
         self.handles.insert(name.into(), handle);
-        return true;
+        true
     }
 }
 
-impl<E> Drop for WorkManager<E> {
+impl Drop for WorkManager {
     fn drop(&mut self) {
         self.cancel_all();
     }
@@ -360,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_work_manager_overwrite() {
-        let mut manager: WorkManager<std::io::Error> = WorkManager::new();
+        let mut manager = WorkManager::new();
         let echo = EchoJob {
             message: "1".into(),
         };
@@ -420,7 +421,14 @@ mod tests {
             message: "tick".into(),
         };
 
-        manager.enqueue_periodic("periodic", job, Duration::from_millis(10), false, false);
+        // No error handler: errors (if any) are ignored, job continues
+        manager.enqueue_periodic(
+            "periodic",
+            job,
+            Duration::from_millis(10),
+            false,
+            |_| Ok(()),
+        );
 
         // Expect at least 3 ticks
         for _ in 0..3 {
@@ -461,13 +469,66 @@ mod tests {
             counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
-        // panic = true, should stop after error
-        manager.enqueue_periodic("fail_job", job, Duration::from_millis(10), false, true);
+        // Use an error handler that stops after the first error (panic-like behavior)
+        manager.enqueue_periodic("fail_job", job, Duration::from_millis(10), false, |err| {
+            Err(err)
+        });
 
         assert_eq!(rx.recv().await, Some("ok".to_string()));
 
         // Wait to ensure no more messages come (it should have errored and stopped)
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_periodic_panic_continue() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut manager = WorkManager::new();
+
+        #[derive(Clone)]
+        struct FailsAfterOne {
+            sender: mpsc::Sender<String>,
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Job for FailsAfterOne {
+            type Output = ();
+            type Error = std::io::Error;
+            async fn run(self) -> Result<(), std::io::Error> {
+                let count = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count == 0 {
+                    let _ = self.sender.send("ok".to_string()).await;
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+                }
+            }
+        }
+
+        let job = FailsAfterOne {
+            sender: tx,
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        // Use an error handler that continues after an error (panic-like behavior)
+        manager.enqueue_periodic(
+            "fail_job",
+            job,
+            Duration::from_millis(10),
+            false,
+            |_| Ok(()),
+        );
+
+        // Expect the first ok
+        let val = rx.recv().await;
+        assert_eq!(val, Some("ok".to_string()));
+
+        // Expect at least 3 ignored errors
+        for _ in 0..3 {
+            assert!(rx.try_recv().is_err());
+        }
+        manager.cancel("fail_job");
     }
 }
