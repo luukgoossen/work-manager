@@ -54,8 +54,6 @@ use std::error::Error;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::Duration;
 
-/// A boxed, thread-safe error type used by `WorkManager`.
-
 /// A job that can be run asynchronously.
 pub trait Job: Send + Sync + Sized {
     type Output: Send + Sync + 'static;
@@ -481,5 +479,56 @@ mod tests {
         // Wait to ensure no more messages come (it should have errored and stopped)
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_periodic_panic_continue() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut manager = WorkManager::new();
+
+        #[derive(Clone)]
+        struct FailsAfterOne {
+            sender: mpsc::Sender<String>,
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Job for FailsAfterOne {
+            type Output = ();
+            type Error = std::io::Error;
+            async fn run(self) -> Result<(), std::io::Error> {
+                let count = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count == 0 {
+                    let _ = self.sender.send("ok".to_string()).await;
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+                }
+            }
+        }
+
+        let job = FailsAfterOne {
+            sender: tx,
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        // Use an error handler that continues after an error (panic-like behavior)
+        manager.enqueue_periodic(
+            "fail_job",
+            job,
+            Duration::from_millis(10),
+            false,
+            |_| Ok(()),
+        );
+
+        // Expect the first ok
+        let val = rx.recv().await;
+        assert_eq!(val, Some("ok".to_string()));
+
+        // Expect at least 3 ignored errors
+        for _ in 0..3 {
+            assert!(rx.try_recv().is_err());
+        }
+        manager.cancel("fail_job");
     }
 }
