@@ -44,7 +44,7 @@
 //!     PrintJob { message: "Tick".into() },
 //!     Duration::from_secs(1),
 //!     false,
-//!     false
+//!     |_| Ok(())
 //! );
 //! # }
 //! ```
@@ -168,15 +168,22 @@ impl WorkManager {
 
     /// Enqueues a periodic job for execution at specified intervals.
     /// If a job with the same name already exists, it will be overwritten if `overwrite` is true.
-    /// If `panic` is true, the periodic job will cancel and return the error upon encountering one.
-    pub fn enqueue_periodic(
+    ///
+    /// `on_error` is a callback that is invoked whenever the job returns an error.
+    /// The callback receives the job's error and returns `Ok` to continue or
+    /// `Err` to stop the periodic execution and finish the task.
+    pub fn enqueue_periodic<J, F>(
         &mut self,
         name: &str,
-        job: impl Job + Clone + 'static,
+        job: J,
         interval: Duration,
         overwrite: bool,
-        panic: bool,
-    ) -> bool {
+        on_error: F,
+    ) -> bool
+    where
+        J: Job + Clone + 'static,
+        F: Fn(J::Error) -> Result<(), J::Error> + Send + Sync + 'static,
+    {
         if self.handles.contains_key(name) {
             if overwrite {
                 self.cancel(name);
@@ -191,11 +198,12 @@ impl WorkManager {
             loop {
                 match job.clone().run().await {
                     Ok(_) => {}
-                    Err(e) => {
-                        if panic {
+                    Err(e) => match on_error(e) {
+                        Ok(_) => {}
+                        Err(e) => {
                             return Err(e.into());
                         }
-                    }
+                    },
                 }
                 interval.tick().await;
             }
@@ -415,7 +423,14 @@ mod tests {
             message: "tick".into(),
         };
 
-        manager.enqueue_periodic("periodic", job, Duration::from_millis(10), false, false);
+        // No error handler: errors (if any) are ignored, job continues
+        manager.enqueue_periodic(
+            "periodic",
+            job,
+            Duration::from_millis(10),
+            false,
+            |_| Ok(()),
+        );
 
         // Expect at least 3 ticks
         for _ in 0..3 {
@@ -456,8 +471,10 @@ mod tests {
             counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
-        // panic = true, should stop after error
-        manager.enqueue_periodic("fail_job", job, Duration::from_millis(10), false, true);
+        // Use an error handler that stops after the first error (panic-like behavior)
+        manager.enqueue_periodic("fail_job", job, Duration::from_millis(10), false, |err| {
+            Err(err)
+        });
 
         assert_eq!(rx.recv().await, Some("ok".to_string()));
 
