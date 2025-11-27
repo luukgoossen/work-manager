@@ -50,14 +50,18 @@
 //! ```
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::error::Error;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::Duration;
+
+/// A boxed, thread-safe error type used by `WorkManager`.
 
 /// A job that can be run asynchronously.
 pub trait Job: Send + Sync + Sized {
     type Output: Send + Sync + 'static;
-    type Error: Send + Sync + 'static;
+    /// Job-specific error type. Must be convertible into a boxed error so
+    /// `WorkManager` does not need to be generic over the error.
+    type Error: Send + Sync + 'static + Into<Box<dyn Error + Send + Sync>>;
 
     /// Runs the job and returns the result.
     fn run(
@@ -114,12 +118,12 @@ where
 }
 
 /// Manages the execution of asynchronous jobs.
-pub struct WorkManager<E> {
-    handles: HashMap<String, JoinHandle<Result<(), E>>>,
+pub struct WorkManager {
+    handles: HashMap<String, JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>>,
 }
 
 // Implement common methods for WorkManager
-impl<E> WorkManager<E> {
+impl WorkManager {
     /// Creates a new WorkManager.
     pub fn new() -> Self {
         Self {
@@ -143,15 +147,10 @@ impl<E> WorkManager<E> {
 }
 
 // Implement job-focused methods for WorkManager
-impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
+impl WorkManager {
     /// Enqueues a job for execution.
     /// If a job with the same name already exists, it will be overwritten if `overwrite` is true.
-    pub fn enqueue(
-        &mut self,
-        name: &str,
-        job: impl Job<Error = E> + 'static,
-        overwrite: bool,
-    ) -> bool {
+    pub fn enqueue(&mut self, name: &str, job: impl Job + 'static, overwrite: bool) -> bool {
         if self.handles.contains_key(name) {
             if overwrite {
                 self.cancel(name);
@@ -160,13 +159,11 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
             }
         }
 
-        let handle: JoinHandle<Result<(), E>> = spawn(async move {
-            job.run().await?;
-            Ok(())
-        });
+        let handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> =
+            spawn(async move { job.run().await.map(|_| ()).map_err(Into::into) });
 
         self.handles.insert(name.into(), handle);
-        return true;
+        true
     }
 
     /// Enqueues a periodic job for execution at specified intervals.
@@ -175,7 +172,7 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
     pub fn enqueue_periodic(
         &mut self,
         name: &str,
-        job: impl Job<Error = E> + Clone + 'static,
+        job: impl Job + Clone + 'static,
         interval: Duration,
         overwrite: bool,
         panic: bool,
@@ -188,7 +185,7 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
             }
         }
 
-        let handle: JoinHandle<Result<(), E>> = spawn(async move {
+        let handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> = spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -196,9 +193,7 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
                     Ok(_) => {}
                     Err(e) => {
                         if panic {
-                            return Err(e);
-                        } else {
-                            eprintln!("Error: {:?}", e);
+                            return Err(e.into());
                         }
                     }
                 }
@@ -207,11 +202,11 @@ impl<E: Debug + Send + Sync + 'static> WorkManager<E> {
         });
 
         self.handles.insert(name.into(), handle);
-        return true;
+        true
     }
 }
 
-impl<E> Drop for WorkManager<E> {
+impl Drop for WorkManager {
     fn drop(&mut self) {
         self.cancel_all();
     }
@@ -360,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_work_manager_overwrite() {
-        let mut manager: WorkManager<std::io::Error> = WorkManager::new();
+        let mut manager = WorkManager::new();
         let echo = EchoJob {
             message: "1".into(),
         };
