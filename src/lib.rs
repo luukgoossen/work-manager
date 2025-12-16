@@ -87,6 +87,20 @@ pub struct Sequence<
     next: F,
 }
 
+impl<Prev, Next, F> Clone for Sequence<Prev, Next, F>
+where
+    Prev: Job + Clone,
+    F: FnOnce(Result<Prev::Output, Prev::Error>) -> Result<Next, Prev::Error> + Send + Sync + Clone,
+    Next: Job<Error = Prev::Error>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prev: self.prev.clone(),
+            next: self.next.clone(),
+        }
+    }
+}
+
 impl<Prev, Next, F> Job for Sequence<Prev, Next, F>
 where
     Prev: Job,
