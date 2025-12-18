@@ -51,7 +51,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use tokio::task::{JoinHandle, spawn};
+use tokio::task::{JoinHandle, JoinSet, spawn};
 use tokio::time::Duration;
 
 /// A job that can be run asynchronously.
@@ -64,13 +64,25 @@ pub trait Job: Send + Sync + Sized {
     /// Runs the job and returns the result.
     fn run(
         self,
-    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send + Sync;
+    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send + Sync + 'static;
 
     /// Turns this job into a sequence where the next job depends on the output of this job.
     /// Does not execute anything until the entire sequence is run.
     fn then<F, Next>(self, next: F) -> Sequence<Self, Next, F>
     where
         F: FnOnce(Result<Self::Output, Self::Error>) -> Result<Next, Self::Error> + Send + Sync,
+        Next: Job<Error = Self::Error>,
+    {
+        Sequence { prev: self, next }
+    }
+
+    /// Turns this job into a sequence of many jobs depending on the output of this job.
+    /// Does not execute anything until the entire sequence is run.
+    fn then_many<F, Next>(self, next: F) -> Sequence<Self, Vec<Next>, F>
+    where
+        F: FnOnce(Result<Self::Output, Self::Error>) -> Result<Vec<Next>, Self::Error>
+            + Send
+            + Sync,
         Next: Job<Error = Self::Error>,
     {
         Sequence { prev: self, next }
@@ -101,11 +113,31 @@ where
     }
 }
 
+impl<Prev, Next, F> Clone for Sequence<Prev, Vec<Next>, F>
+where
+    Prev: Job + Clone,
+    F: FnOnce(Result<Prev::Output, Prev::Error>) -> Result<Vec<Next>, Prev::Error>
+        + Send
+        + Sync
+        + Clone,
+    Next: Job<Error = Prev::Error>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prev: self.prev.clone(),
+            next: self.next.clone(),
+        }
+    }
+}
+
 impl<Prev, Next, F> Job for Sequence<Prev, Next, F>
 where
-    Prev: Job,
-    F: FnOnce(Result<Prev::Output, Prev::Error>) -> Result<Next, Prev::Error> + Send + Sync,
-    Next: Job<Error = Prev::Error>,
+    Prev: Job + 'static,
+    F: FnOnce(Result<Prev::Output, Prev::Error>) -> Result<Next, Prev::Error>
+        + Send
+        + Sync
+        + 'static,
+    Next: Job<Error = Prev::Error> + 'static,
 {
     type Output = Next::Output;
     type Error = Prev::Error;
@@ -119,13 +151,37 @@ where
         let job = (self.next)(output)?;
         job.run().await
     }
+}
 
-    fn then<Fn, Nx>(self, next: Fn) -> Sequence<Self, Nx, Fn>
-    where
-        Fn: FnOnce(Result<Self::Output, Self::Error>) -> Result<Nx, Self::Error> + Send + Sync,
-        Nx: Job<Error = Self::Error>,
-    {
-        Sequence { prev: self, next }
+impl<Prev, Next, F> Job for Sequence<Prev, Vec<Next>, F>
+where
+    Prev: Job + 'static,
+    F: FnOnce(Result<Prev::Output, Prev::Error>) -> Result<Vec<Next>, Prev::Error>
+        + Send
+        + Sync
+        + 'static,
+    Next: Job<Error = Prev::Error> + 'static,
+{
+    type Output = Vec<Next::Output>;
+    type Error = Prev::Error;
+
+    /// Runs the sequence as a job and returns the result.
+    async fn run(self) -> Result<Self::Output, Self::Error> {
+        // run all previous jobs
+        let output = self.prev.run().await;
+
+        // pass the output to the next job generator and run it
+        let jobs = (self.next)(output)?;
+
+        // iterate over the jobs and run them all in parallel
+        let mut set = JoinSet::new();
+        for job in jobs {
+            set.spawn(job.run());
+        }
+
+        // capture the results
+        let results = set.join_all().await;
+        results.into_iter().collect()
     }
 }
 
@@ -328,6 +384,74 @@ mod tests {
 
         let result = sequence.run().await;
         assert_eq!(result.unwrap(), "run_sequence_2");
+    }
+
+    // test to see if we can run a sequence of many jobs
+    #[tokio::test]
+    async fn run_sequence_many() {
+        let echo = EchoJob {
+            message: "run_sequence_1".into(),
+        };
+
+        let sequence = echo.then_many(|result| {
+            let result = result?;
+            assert_eq!(result, "run_sequence_1");
+
+            let mut jobs = Vec::with_capacity(result.len());
+            for i in 0..result.len().clone() {
+                jobs.push(EchoJob {
+                    message: format!("run_sequence_many_{}", i),
+                });
+            }
+
+            Ok(jobs)
+        });
+
+        let result = sequence.run().await.unwrap();
+        assert_eq!(result.len(), 14);
+        assert_eq!(result[0], "run_sequence_many_0");
+        assert_eq!(result[13], "run_sequence_many_13");
+    }
+
+    // test to see if we can run a complex sequence of many jobs
+    #[tokio::test]
+    async fn run_sequence_many_complex() {
+        let echo = EchoJob {
+            message: "run_sequence_1".into(),
+        };
+
+        let sequence = echo.then_many(|result| {
+            let result = result?;
+            assert_eq!(result, "run_sequence_1");
+
+            let mut jobs = Vec::with_capacity(result.len());
+            for i in 0..result.len().clone() {
+                let echo_a = EchoJob {
+                    message: format!("run_sequence_many_{}_a", i),
+                };
+                let echo_b = echo_a.then(move |result| {
+                    assert_eq!(result?, format!("run_sequence_many_{}_a", i));
+                    Ok(EchoJob {
+                        message: format!("run_sequence_many_{}_b", i),
+                    })
+                });
+                let echo_c = echo_b.then(move |result| {
+                    assert_eq!(result?, format!("run_sequence_many_{}_b", i));
+                    Ok(EchoJob {
+                        message: format!("run_sequence_many_{}_c", i),
+                    })
+                });
+
+                jobs.push(echo_c);
+            }
+
+            Ok(jobs)
+        });
+
+        let result = sequence.run().await.unwrap();
+        assert_eq!(result.len(), 14);
+        assert_eq!(result[0], "run_sequence_many_0_c");
+        assert_eq!(result[13], "run_sequence_many_13_c");
     }
 
     // test to see if we can run a sequence of jobs
